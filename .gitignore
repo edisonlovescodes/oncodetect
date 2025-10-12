@@ -1,0 +1,47 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+
+# Node
+node_modules/
+build/
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+
+# Database
+*.db
+*.sqlite
+
+# Large ML files - host externally
+backend/oncodetect_model_v3.h5
+backend/heatmaps/
+
+# Large datasets - link to source instead
+ml-model/raw_data/
+ml-model/processed_data_v3/
+
+# Docker
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Small sample data folders (keep for demo)
+ml-model/processed_data/
+ml-model/processed_data_v2/
+
+
