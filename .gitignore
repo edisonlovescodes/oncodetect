@@ -26,7 +26,6 @@ npm-debug.log*
 *.sqlite
 
 # Large ML files - host externally
-backend/oncodetect_model_v3.h5
 backend/heatmaps/
 
 # Large datasets - link to source instead
