@@ -247,7 +247,7 @@ Edison Essien
 Portfolio: edisoncodes.ai
 LinkedIn: @essienedison
 GitHub: edisonlovescodes
-Email: organicedison@gmail.com.com
+Email: organicedison@gmail.com
 
 
 🙏 Acknowledgments
