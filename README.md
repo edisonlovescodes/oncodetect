@@ -9,7 +9,7 @@ A full-stack deep learning web application that analyzes lung CT scans to detect
 ![React](https://img.shields.io/badge/React-18-61dafb)
 ![Docker](https://img.shields.io/badge/Docker-Ready-2496ed)
 
----
+----
 
 ## 🎯 Project Overview
 
