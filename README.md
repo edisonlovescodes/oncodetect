@@ -87,7 +87,7 @@ OncoDetect leverages transfer learning with ResNet50 to provide automated lung n
 ### Run with Docker (Recommended)
 ```bash
 # Clone the repository
-git clone <your-repo-url>
+git clone https://github.com/edisonlovescodes/oncodetect
 cd oncodetect
 
 # Start the application
