@@ -44,3 +44,9 @@ ml-model/processed_data/
 ml-model/processed_data_v2/
 
 
+
+backend/data/
+.pytest_cache/
+
+frontend/dist/
+.venv/

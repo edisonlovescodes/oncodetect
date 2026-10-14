@@ -1,222 +1,211 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-import tensorflow as tf
-from tensorflow import keras
-import numpy as np
-import cv2
-from PIL import Image
+"""Cropped lung-nodule image prototype; serving correctness is not clinical validation."""
+
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import hashlib
 import io
+import logging
 import os
-from datetime import datetime
-import uuid
+from pathlib import Path
+from threading import Lock
+import warnings
 
-# Import database components
-from database import init_db, get_db, PredictionLog
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import numpy as np
+from PIL import Image, UnidentifiedImageError
+from sqlalchemy.orm import Session, sessionmaker
 
-# ========== Initialize FastAPI App ==========
-app = FastAPI(
-    title="OncoDetect API",
-    description="AI-powered lung nodule malignancy detection with database logging",
-    version="1.0.1"
-)
+try:
+    from .database import Base, PredictionLog, make_engine
+except ImportError:  # also support `uvicorn main:app` from backend/
+    from database import Base, PredictionLog, make_engine
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://oncodetect-frontend.onrender.com",
-        "https://*.onrender.com"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ========== Global Variables ==========
-MODEL = None
-MODEL_PATH = "oncodetect_model_v3.h5"
-HEATMAP_DIR = "heatmaps"
+LOGGER = logging.getLogger(__name__)
+ROOT = Path(__file__).resolve().parent
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_PIXELS = 16_000_000
 IMG_SIZE = (224, 224)
 
-os.makedirs(HEATMAP_DIR, exist_ok=True)
 
-# ========== Startup: Load Model & Initialize DB ==========
-@app.on_event("startup")
-async def startup_event():
-    global MODEL
-    print("🚀 Starting OncoDetect API...")
-    
-    # Initialize database
-    init_db()
-    
-    # Load model
-    print("Loading model...")
-    MODEL = keras.models.load_model(MODEL_PATH)
-    print("✅ Model loaded successfully!")
-    print("✅ Database initialized!")
+def load_model(path):
+    from tensorflow import keras  # model loading is optional for service tests
 
-# ========== Helper Functions ==========
+    return keras.models.load_model(path, compile=False)
 
-def preprocess_image(image_bytes):
-    """Preprocess uploaded image."""
-    image = Image.open(io.BytesIO(image_bytes))
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-    image = image.resize(IMG_SIZE)
-    img_array = np.array(image).astype('uint8')
-    img_array = np.expand_dims(img_array, axis=0)
-    return img_array, image
 
-def generate_simple_heatmap(image, prediction_score):
-    """Generate visualization heatmap."""
-    img_array = np.array(image)
-    h, w = img_array.shape[:2]
-    y, x = np.ogrid[:h, :w]
-    center_y, center_x = h // 2, w // 2
-    mask = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    mask = 1 - (mask / mask.max())
-    mask = mask * prediction_score
-    heatmap = np.uint8(255 * mask)
-    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-    superimposed = cv2.addWeighted(img_bgr, 0.6, heatmap, 0.4, 0)
-    return superimposed
-
-# ========== API Endpoints ==========
-
-@app.get("/")
-async def root():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "service": "OncoDetect API",
-        "model_loaded": MODEL is not None,
-        "version": "1.0.1",
-        "database": "connected"
-    }
-
-@app.get("/health")
-async def health_check(db: Session = Depends(get_db)):
-    """Detailed health check with database stats."""
-    prediction_count = db.query(PredictionLog).count()
-    return {
-        "status": "healthy",
-        "model_loaded": MODEL is not None,
-        "model_path": MODEL_PATH,
-        "total_predictions": prediction_count,
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.post("/predict")
-async def predict(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """
-    Main prediction endpoint with database logging.
-    """
+def preprocess_image(data):
     try:
-        if MODEL is None:
-            raise HTTPException(status_code=503, detail="Model not loaded")
-        
-        if not file.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail="File must be an image")
-        
-        # Read and preprocess image
-        image_bytes = await file.read()
-        img_array, original_image = preprocess_image(image_bytes)
-        
-        # Make prediction
-        prediction = MODEL.predict(img_array, verbose=0)[0][0]
-        is_malignant = prediction > 0.5
-        confidence = float(prediction if is_malignant else 1 - prediction)
-        label = "Malignant" if is_malignant else "Benign"
-        
-        # Generate heatmap
-        heatmap_image = generate_simple_heatmap(original_image, prediction)
-        heatmap_filename = f"{uuid.uuid4()}.jpg"
-        heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
-        cv2.imwrite(heatmap_path, heatmap_image)
-        
-        # ========== Log to Database ==========
-        db_log = PredictionLog(
-            input_filename=file.filename,
-            prediction_result=label,
-            confidence_score=confidence,
-            raw_score=float(prediction),
-            heatmap_filename=heatmap_filename
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                if image.width * image.height > MAX_IMAGE_PIXELS:
+                    raise HTTPException(413, "Image dimensions exceed the 16-million-pixel limit")
+                if image.format not in {"PNG", "JPEG"}:
+                    raise HTTPException(400, "Upload a PNG or JPEG nodule crop")
+                image.load()
+                # Preserve the packaged artifact's previous input contract; no recovered trainer
+                # exists to establish its training-time normalization.
+                rgb = image.convert("RGB").resize(IMG_SIZE)
+                return np.expand_dims(np.asarray(rgb, dtype=np.uint8), 0)
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise HTTPException(413, "Image dimensions are too large") from None
+    except (UnidentifiedImageError, OSError, ValueError):
+        raise HTTPException(400, "Image could not be decoded") from None
+
+
+def create_app(*, model_path=None, database_url=None, model_loader=load_model):
+    artifact = Path(
+        model_path or os.getenv("MODEL_PATH", ROOT / "oncodetect_model_v3.h5")
+    ).resolve()
+    data_dir = Path(os.getenv("ONCODETECT_DATA_DIR", ROOT / "data")).resolve()
+    url = database_url or os.getenv("DATABASE_URL", f'sqlite:///{data_dir / "oncodetect.db"}')
+    engine = make_engine(url)
+    sessions = sessionmaker(bind=engine, autoflush=False)
+    inference_lock = Lock()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        Base.metadata.create_all(engine)
+        app.state.model = None
+        app.state.model_sha256 = None
+        try:
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            app.state.model = model_loader(artifact)
+            app.state.model_sha256 = digest
+        except Exception:
+            LOGGER.exception("Model unavailable; inference will return 503")
+        try:
+            yield
+        finally:
+            app.state.model = None
+            engine.dispose()
+
+    app = FastAPI(
+        title="OncoDetect API",
+        version="1.1.0",
+        lifespan=lifespan,
+        description="Research prototype for cropped nodule images; not whole-scan detection.",
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            s.strip()
+            for s in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+            if s.strip()
+        ],
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type"],
+    )
+    routes = APIRouter()
+
+    def get_db():
+        with sessions() as session:
+            yield session
+
+    @routes.get("/")
+    def root():
+        return {"service": "OncoDetect API", "version": "1.1.0", "health_url": "/api/health"}
+
+    @routes.get("/health")
+    def health(db: Session = Depends(get_db)):
+        ready = app.state.model is not None
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "status": "ready" if ready else "model_unavailable",
+                "model_loaded": ready,
+                "model_sha256": app.state.model_sha256,
+                "total_predictions": db.query(PredictionLog).count(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "evaluation_status": "historical accuracy not independently reproduced",
+            },
         )
-        db.add(db_log)
-        db.commit()
-        db.refresh(db_log)
-        
-        # Prepare response
-        response = {
-            "prediction": label,
-            "confidence": round(confidence * 100, 2),
-            "raw_score": float(prediction),
-            "heatmap_url": f"/heatmap/{heatmap_filename}",
-            "timestamp": db_log.timestamp.isoformat(),
-            "filename": file.filename,
-            "prediction_id": db_log.id
-        }
-        
-        print(f"✅ Prediction #{db_log.id}: {label} ({confidence*100:.1f}%) - {file.filename}")
-        
-        return JSONResponse(content=response)
-        
-    except Exception as e:
-        print(f"❌ Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/heatmap/{filename}")
-async def get_heatmap(filename: str):
-    """Serve generated heatmap images."""
-    file_path = os.path.join(HEATMAP_DIR, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Heatmap not found")
-    return FileResponse(file_path, media_type="image/jpeg")
-
-@app.get("/predictions")
-async def get_predictions(limit: int = 10, db: Session = Depends(get_db)):
-    """Get recent predictions from database."""
-    predictions = db.query(PredictionLog).order_by(
-        PredictionLog.timestamp.desc()
-    ).limit(limit).all()
-    
-    return {
-        "count": len(predictions),
-        "predictions": [
-            {
-                "id": p.id,
-                "timestamp": p.timestamp.isoformat(),
-                "filename": p.input_filename,
-                "prediction": p.prediction_result,
-                "confidence": round(p.confidence_score * 100, 2)
+    @routes.post("/predict")
+    def predict(file: UploadFile = File(...), db: Session = Depends(get_db)):
+        if app.state.model is None:
+            raise HTTPException(503, "Model unavailable")
+        if file.content_type not in {"image/png", "image/jpeg"}:
+            raise HTTPException(400, "Upload a PNG or JPEG nodule crop")
+        data = file.file.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "Upload exceeds the 8 MiB limit")
+        image = preprocess_image(data)
+        try:
+            # Sync route runs in FastAPI's thread pool. Serialize access to the model.
+            with inference_lock:
+                score = float(np.asarray(app.state.model.predict(image, verbose=0)).reshape(-1)[0])
+            if not np.isfinite(score) or not 0 <= score <= 1:
+                raise ValueError("Invalid model score")
+            label = "Malignant" if score > 0.5 else "Benign"
+            class_score = score if score > 0.5 else 1 - score
+            record = PredictionLog(
+                input_filename=(file.filename or "upload")[:255],
+                prediction_result=label,
+                confidence_score=class_score,
+                raw_score=score,
+            )
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+            return {
+                "prediction": label,
+                "confidence": round(class_score * 100, 2),
+                "raw_score": score,
+                "timestamp": record.timestamp.replace(tzinfo=timezone.utc).isoformat(),
+                "filename": record.input_filename,
+                "prediction_id": record.id,
+                "model_sha256": app.state.model_sha256,
+                "score_note": "Model score, not a calibrated clinical probability",
             }
-            for p in predictions
-        ]
-    }
+        except Exception:
+            db.rollback()
+            LOGGER.exception("Inference or persistence failed")
+            raise HTTPException(500, "Prediction could not be completed") from None
 
-@app.get("/stats")
-async def get_stats(db: Session = Depends(get_db)):
-    """Get prediction statistics."""
-    total = db.query(PredictionLog).count()
-    benign = db.query(PredictionLog).filter(
-        PredictionLog.prediction_result == "Benign"
-    ).count()
-    malignant = db.query(PredictionLog).filter(
-        PredictionLog.prediction_result == "Malignant"
-    ).count()
-    
-    return {
-        "total_predictions": total,
-        "benign_count": benign,
-        "malignant_count": malignant,
-        "benign_percentage": round((benign / total * 100) if total > 0 else 0, 2),
-        "malignant_percentage": round((malignant / total * 100) if total > 0 else 0, 2)
-    }
+    @routes.get("/predictions")
+    def history(limit: int = Query(10, ge=1, le=100), db: Session = Depends(get_db)):
+        records = (
+            db.query(PredictionLog)
+            .order_by(PredictionLog.timestamp.desc(), PredictionLog.id.desc())
+            .limit(limit)
+            .all()
+        )
+        return {
+            "count": len(records),
+            "predictions": [
+                {
+                    "id": p.id,
+                    "timestamp": p.timestamp.replace(tzinfo=timezone.utc).isoformat(),
+                    "filename": p.input_filename,
+                    "prediction": p.prediction_result,
+                    "confidence": round(p.confidence_score * 100, 2),
+                }
+                for p in records
+            ],
+        }
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    @routes.get("/stats")
+    def stats(db: Session = Depends(get_db)):
+        total = db.query(PredictionLog).count()
+        benign = db.query(PredictionLog).filter(PredictionLog.prediction_result == "Benign").count()
+        malignant = total - benign
+        return {
+            "total_predictions": total,
+            "benign_count": benign,
+            "malignant_count": malignant,
+            "benign_percentage": round(benign / total * 100, 2) if total else 0,
+            "malignant_percentage": round(malignant / total * 100, 2) if total else 0,
+        }
+
+    app.include_router(routes, prefix="/api")
+    # Preserve pre-refresh clients; both mounts share the same implementation.
+    app.include_router(routes, include_in_schema=False)
+    return app
+
+
+app = create_app()
