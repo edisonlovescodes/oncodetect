@@ -1,42 +1,30 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from datetime import datetime
-import os
+"""Prediction storage. Existing databases remain readable; no schema migration required."""
 
-# Database URL - using SQLite for development (easier setup)
-# For production, you'd use: postgresql://user:password@localhost/dbname
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./oncodetect.db")
+from datetime import datetime, timezone
+from pathlib import Path
+from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import declarative_base
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# ========== Prediction Log Model ==========
+
+def make_engine(url):
+    parsed = make_url(url)
+    if parsed.get_backend_name() == "sqlite":
+        if parsed.database and parsed.database != ":memory:":
+            Path(parsed.database).parent.mkdir(parents=True, exist_ok=True)
+        return create_engine(url, connect_args={"check_same_thread": False})
+    return create_engine(url)
+
+
 class PredictionLog(Base):
     __tablename__ = "predictions"
-    
     id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     input_filename = Column(String, nullable=False)
-    prediction_result = Column(String, nullable=False)  # "Benign" or "Malignant"
+    prediction_result = Column(String, nullable=False)
     confidence_score = Column(Float, nullable=False)
     raw_score = Column(Float, nullable=False)
+    # Kept for compatibility with existing data. New predictions do not create an overlay.
     heatmap_filename = Column(String, nullable=True)
-    
-    def __repr__(self):
-        return f"<Prediction(id={self.id}, result={self.prediction_result}, confidence={self.confidence_score})>"
-
-# ========== Initialize Database ==========
-def init_db():
-    """Create all tables."""
-    Base.metadata.create_all(bind=engine)
-    print("✅ Database tables created")
-
-def get_db():
-    """Dependency for getting database session."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
