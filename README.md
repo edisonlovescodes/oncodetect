@@ -1,5 +1,7 @@
 # OncoDetect
 
+[Project overview and screenshots](https://byedison.com/projects/oncodetect/) · [Edison’s portfolio](https://byedison.com/)
+
 A full-stack portfolio prototype for **cropped lung-nodule image classification**. A React interface submits PNG/JPEG crops to a FastAPI service, which runs a packaged TensorFlow ResNet50-based artifact and records results in SQLite. It does not locate nodules in whole CT volumes or diagnose patients.
 
 ## What is implemented
